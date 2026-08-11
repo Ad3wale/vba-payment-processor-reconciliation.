@@ -1,0 +1,1490 @@
+VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = "Sheet1"
+Attribute VB_GlobalNameSpace = False
+Attribute VB_Creatable = False
+Attribute VB_PredeclaredId = True
+Attribute VB_Exposed = True
+Option Explicit
+
+' Master Entry Point - 5 Processor Sequential Engine
+Sub Auto_Reconcile_Sequential()
+    On Error GoTo ErrorHandler
+
+    Dim masterWB As Workbook
+    Dim startDate As Date, endDate As Date
+    Dim dateInput As String, dateParts() As String
+    Dim defaultStart As String, defaultEnd As String
+    Dim currentDay As Integer
+
+10: Set masterWB = ThisWorkbook
+
+    ' 1. SCHEDULE-AWARE DATE LOGIC
+20: currentDay = Weekday(Date, vbMonday)
+    Select Case currentDay
+        Case 1: defaultStart = Format(Date - 3, "yyyy-mm-dd"): defaultEnd = Format(Date - 1, "yyyy-mm-dd")
+        Case 2 To 5: defaultStart = Format(Date - 1, "yyyy-mm-dd"): defaultEnd = Format(Date - 1, "yyyy-mm-dd")
+        Case 6, 7: defaultStart = Format(Date - 1, "yyyy-mm-dd"): defaultEnd = Format(Date - 1, "yyyy-mm-dd")
+    End Select
+
+30: dateInput = InputBox("Confirm Reconciliation Date Range (YYYY-MM-DD to YYYY-MM-DD):", "Master Reconciliation Window", defaultStart & " to " & defaultEnd)
+40: If Trim(dateInput) = "" Then Exit Sub
+
+50: On Error Resume Next
+    dateParts = Split(dateInput, " to ")
+    startDate = CDate(Trim(dateParts(0)))
+    endDate = CDate(Trim(dateParts(1)))
+    On Error GoTo ErrorHandler
+
+60: If startDate = 0 Or endDate = 0 Then
+        MsgBox "Invalid date format. Use YYYY-MM-DD to YYYY-MM-DD.", vbExclamation, "Date Error"
+        Exit Sub
+    End If
+
+    ' PHASE 1: BLUEPENGUIN
+70: MsgBox "PHASE 1 OF 5:" & vbCrLf & "Please select the BLUEPENGUIN report file on the next screen.", vbInformation, "Bluepenguin Step"
+    If Not Reconcile_Bluepenguin_Direct(masterWB, startDate, endDate) Then
+        MsgBox "Bluepenguin reconciliation was skipped or cancelled.", vbExclamation, "Phase 1 Incomplete"
+        Exit Sub
+    End If
+
+    ' PHASE 2: ITC
+80: MsgBox "PHASE 1 COMPLETE!" & vbCrLf & vbCrLf & "PHASE 2 OF 5:" & vbCrLf & "Please select the ITC report file (.csv or .xlsx) on the next screen.", vbInformation, "ITC Step"
+    If Not Reconcile_ITC_Direct(masterWB, startDate, endDate) Then
+        MsgBox "ITC reconciliation was skipped or cancelled.", vbExclamation, "Phase 2 Incomplete"
+        Exit Sub
+    End If
+
+    ' PHASE 3: BROADSPECTRUM
+90: MsgBox "PHASE 2 COMPLETE!" & vbCrLf & vbCrLf & "PHASE 3 OF 5:" & vbCrLf & "Please select the BROADSPECTRUM report file on the next screen.", vbInformation, "Broadspectrum Step"
+    If Not Reconcile_Broadspectrum_Direct(masterWB, startDate, endDate) Then
+        MsgBox "Broadspectrum reconciliation was skipped or cancelled.", vbExclamation, "Phase 3 Incomplete"
+        Exit Sub
+    End If
+
+    ' PHASE 4: FINCRA
+100: MsgBox "PHASE 3 COMPLETE!" & vbCrLf & vbCrLf & "PHASE 4 OF 5:" & vbCrLf & "Please select the FINCRA report file (.csv or .xlsx) on the next screen.", vbInformation, "Fincra Step"
+    If Not Reconcile_Fincra_Direct(masterWB, startDate, endDate) Then
+        MsgBox "Fincra reconciliation was skipped or cancelled.", vbExclamation, "Phase 4 Incomplete"
+        Exit Sub
+    End If
+
+    ' PHASE 5: NSANO
+110: MsgBox "PHASE 4 COMPLETE!" & vbCrLf & vbCrLf & "PHASE 5 OF 5: NSANO" & vbCrLf & "You will now process the 3 NSANO report files one by one.", vbInformation, "Nsano Step"
+    If Not Reconcile_Nsano_Direct(masterWB, startDate, endDate) Then
+        MsgBox "Nsano reconciliation was skipped or cancelled.", vbExclamation, "Phase 5 Incomplete"
+        Exit Sub
+    End If
+
+120: MsgBox "Master Reconciliation Complete for Bluepenguin, ITC, Broadspectrum, Fincra, and Nsano!", vbInformation, "All Done"
+    Exit Sub
+
+ErrorHandler:
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    MsgBox "An error occurred at Line " & Erl & ":" & vbCrLf & _
+           Err.Description & " (Code: " & Err.Number & ")", vbCritical, "Execution Error"
+End Sub
+
+' -------------------------------------------------------------
+' 1. BLUEPENGUIN ENGINE (Targeting BLUPAY on KORA-PAYOUT)
+' -------------------------------------------------------------
+Private Function Reconcile_Bluepenguin_Direct(ByRef masterWB As Workbook, ByVal startDate As Date, ByVal endDate As Date) As Boolean
+    On Error GoTo ErrorHandler
+    
+    Dim blueFilePath As Variant, blueWB As Workbook, procWS As Worksheet
+    Dim koraPayinWS As Worksheet, koraPayoutWS As Worksheet
+    Dim destPayinWS As Worksheet, destPayoutWS As Worksheet
+    
+    Dim procData As Variant, koraPayinData As Variant, koraPayoutData As Variant
+    Dim procLastRow As Long, procLastCol As Long
+    Dim koraPayinLastRow As Long, koraPayinLastCol As Long, koraPayinValidRows As Long
+    Dim koraPayoutLastRow As Long, koraPayoutLastCol As Long, koraPayoutValidRows As Long
+    
+    Dim koraPayinDict As Collection, koraPayoutDict As Collection
+    Set koraPayinDict = New Collection: Set koraPayoutDict = New Collection
+    
+    Dim i As Long, k As Long, c As Long, outRow As Long, matchedRow As Long
+    Dim matchedPayinCount As Long, unmatchedPayinCount As Long
+    Dim matchedPayoutCount As Long, unmatchedPayoutCount As Long
+    
+    Dim matchedPayinIdx() As Long, unmatchedPayinIdx() As Long
+    Dim matchedPayoutIdx() As Long, unmatchedPayoutIdx() As Long
+    Dim koraPayinMatched() As Boolean, koraPayoutMatched() As Boolean
+    
+    Dim dateOnly As Date, statusVal As String, clientRef As String, cellVal As String, procName As String
+    Dim isPayout As Boolean, statusCol As Long
+    Dim totalOutRows As Long, outArr() As Variant
+
+    blueFilePath = Application.GetOpenFilename(Title:="Select Bluepenguin Report File")
+    If blueFilePath = False Or Trim(CStr(blueFilePath)) = "" Then Reconcile_Bluepenguin_Direct = False: Exit Function
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    Set koraPayinWS = masterWB.Sheets("KORA-PAYIN")
+    Set koraPayoutWS = masterWB.Sheets("KORA-PAYOUT")
+    
+    On Error Resume Next
+    Set destPayinWS = masterWB.Sheets("Blupenguin Payin")
+    If destPayinWS Is Nothing Then Set destPayinWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayinWS.Name = "Blupenguin Payin"
+    destPayinWS.Cells.Clear
+    
+    Set destPayoutWS = masterWB.Sheets("Blu Pay-out")
+    If destPayoutWS Is Nothing Then Set destPayoutWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayoutWS.Name = "Blu Pay-out"
+    destPayoutWS.Cells.Clear
+    On Error GoTo ErrorHandler
+
+    Set blueWB = Workbooks.Open(FileName:=CStr(blueFilePath), ReadOnly:=True)
+    On Error Resume Next
+    Set procWS = blueWB.Worksheets("Blupenguin Payin")
+    If procWS Is Nothing Then Set procWS = blueWB.Worksheets(1)
+    On Error GoTo ErrorHandler
+
+    procLastRow = procWS.Cells(procWS.Rows.Count, "N").End(xlUp).Row
+    procLastCol = procWS.Cells(1, procWS.Columns.Count).End(xlToLeft).Column
+    If procLastRow < 2 Then procLastRow = 2
+    If procLastCol < 14 Then procLastCol = 14
+
+    procData = procWS.Range(procWS.Cells(1, 1), procWS.Cells(procLastRow, procLastCol)).Value
+    blueWB.Close SaveChanges:=False
+    Set blueWB = Nothing
+    Set procWS = Nothing
+
+    ' Ingest KORA-PAYIN & Build Hash Table (Col B for BLUPENGUIN)
+    koraPayinLastRow = koraPayinWS.Cells(koraPayinWS.Rows.Count, 1).End(xlUp).Row
+    koraPayinLastCol = koraPayinWS.Cells(1, koraPayinWS.Columns.Count).End(xlToLeft).Column
+    If koraPayinLastRow < 2 Then koraPayinLastRow = 2
+    If koraPayinLastCol < 3 Then koraPayinLastCol = 3
+    koraPayinData = koraPayinWS.Range(koraPayinWS.Cells(1, 1), koraPayinWS.Cells(koraPayinLastRow, koraPayinLastCol)).Value
+
+    koraPayinValidRows = koraPayinLastRow
+    For k = 2 To koraPayinLastRow
+        procName = UCase(Trim(CStr(koraPayinData(k, 1)))) & " " & UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayinValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "BLU") > 0 Or InStr(procName, "BLUEPENGUIN") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayinData(k, 3))))
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayinDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ' Ingest KORA-PAYOUT & Build Hash Table (Specifically Col C for BLUPAY / BLUEPENGUIN)
+    koraPayoutLastRow = koraPayoutWS.Cells(koraPayoutWS.Rows.Count, 1).End(xlUp).Row
+    koraPayoutLastCol = koraPayoutWS.Cells(1, koraPayoutWS.Columns.Count).End(xlToLeft).Column
+    If koraPayoutLastRow < 2 Then koraPayoutLastRow = 2
+    If koraPayoutLastCol < 5 Then koraPayoutLastCol = 5
+    koraPayoutData = koraPayoutWS.Range(koraPayoutWS.Cells(1, 1), koraPayoutWS.Cells(koraPayoutLastRow, koraPayoutLastCol)).Value
+
+    koraPayoutValidRows = koraPayoutLastRow
+    For k = 2 To koraPayoutLastRow
+        procName = UCase(Trim(CStr(koraPayoutData(k, 1)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 2)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayoutValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayoutData(k, 3)))) ' Explicitly Column C
+        If InStr(procName, "BLUPAY") > 0 Or InStr(procName, "BLU") > 0 Or InStr(procName, "BLUEPENGUIN") > 0 Or InStr(procName, "BLUPENGUIN") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayoutData(k, 5)))) ' Col E Reference
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayoutDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ReDim koraPayinMatched(1 To koraPayinValidRows)
+    ReDim koraPayoutMatched(1 To koraPayoutValidRows)
+    ReDim matchedPayinIdx(1 To procLastRow): ReDim unmatchedPayinIdx(1 To procLastRow)
+    ReDim matchedPayoutIdx(1 To procLastRow): ReDim unmatchedPayoutIdx(1 To procLastRow)
+
+    matchedPayinCount = 0: unmatchedPayinCount = 0
+    matchedPayoutCount = 0: unmatchedPayoutCount = 0
+
+    For i = 2 To procLastRow
+        dateOnly = SafeDateText(procData(i, 2))  ' Col B
+        statusVal = Trim(CStr(procData(i, 8)))   ' Col H
+        
+        If (UCase(statusVal) = "SUCCESSFUL" Or UCase(statusVal) = "SUCCESS") And dateOnly >= startDate And dateOnly <= endDate Then
+            clientRef = UCase(Trim(CStr(procData(i, 14)))) ' Col N
+            
+            isPayout = False
+            For c = 1 To procLastCol
+                cellVal = UCase(Trim(CStr(procData(i, c))))
+                If InStr(cellVal, "PAYOUT") > 0 Or InStr(cellVal, "CASHOUT") > 0 Then isPayout = True: Exit For
+            Next c
+            
+            matchedRow = 0
+            If isPayout Then
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    matchedRow = koraPayoutDict(clientRef)
+                    On Error GoTo ErrorHandler
+                End If
+                If matchedRow > 0 Then
+                    koraPayoutMatched(matchedRow) = True
+                    matchedPayoutCount = matchedPayoutCount + 1: matchedPayoutIdx(matchedPayoutCount) = i
+                Else
+                    unmatchedPayoutCount = unmatchedPayoutCount + 1: unmatchedPayoutIdx(unmatchedPayoutCount) = i
+                End If
+            Else
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    matchedRow = koraPayinDict(clientRef)
+                    On Error GoTo ErrorHandler
+                End If
+                If matchedRow > 0 Then
+                    koraPayinMatched(matchedRow) = True
+                    matchedPayinCount = matchedPayinCount + 1: matchedPayinIdx(matchedPayinCount) = i
+                Else
+                    unmatchedPayinCount = unmatchedPayinCount + 1: unmatchedPayinIdx(unmatchedPayinCount) = i
+                End If
+            End If
+        End If
+    Next i
+
+    ' Write Payin Sheet
+    WriteProcessorTable destPayinWS, procData, procLastCol, matchedPayinCount, matchedPayinIdx, unmatchedPayinCount, unmatchedPayinIdx, 14, "PAYINS"
+    AddDynamicSums destPayinWS, procData, procLastCol, Array("INVOICE AMOUNT")
+
+    ' Write Payout Sheet
+    WriteProcessorTable destPayoutWS, procData, procLastCol, matchedPayoutCount, matchedPayoutIdx, unmatchedPayoutCount, unmatchedPayoutIdx, 14, "PAYOUTS"
+    AddDynamicSums destPayoutWS, procData, procLastCol, Array("INVOICE AMOUNT")
+
+    ' Update Ledgers (Specifically targets BLUPAY on KORA-PAYOUT)
+    UpdateLedgerStatus koraPayinWS, koraPayinData, koraPayinValidRows, koraPayinLastCol, koraPayinMatched, "BLU", 2
+    UpdateLedgerStatusMultiCol koraPayoutWS, koraPayoutData, koraPayoutValidRows, koraPayoutLastCol, koraPayoutMatched, Array("BLUPAY", "BLUEPENGUIN", "BLUPENGUIN", "BLU")
+
+    ' Clean RAM Memory
+    Set koraPayinDict = Nothing: Set koraPayoutDict = Nothing
+    Erase procData: Erase koraPayinData: Erase koraPayoutData
+    Erase matchedPayinIdx: Erase unmatchedPayinIdx: Erase matchedPayoutIdx: Erase unmatchedPayoutIdx
+    Erase koraPayinMatched: Erase koraPayoutMatched
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Bluepenguin_Direct = True
+    Exit Function
+
+ErrorHandler:
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Bluepenguin_Direct = False
+End Function
+
+' -------------------------------------------------------------
+' 2. ITC ENGINE (Sums net_amount)
+' -------------------------------------------------------------
+Private Function Reconcile_ITC_Direct(ByRef masterWB As Workbook, ByVal startDate As Date, ByVal endDate As Date) As Boolean
+    On Error GoTo ErrorHandler
+    
+    Dim itcFilePath As Variant, itcWB As Workbook, procWS As Worksheet
+    Dim koraPayinWS As Worksheet, koraPayoutWS As Worksheet
+    Dim destPayinWS As Worksheet, destPayoutWS As Worksheet
+    
+    Dim procData As Variant, koraPayinData As Variant, koraPayoutData As Variant
+    Dim procLastRow As Long, procLastCol As Long
+    Dim koraPayinLastRow As Long, koraPayinLastCol As Long, koraPayinValidRows As Long
+    Dim koraPayoutLastRow As Long, koraPayoutLastCol As Long, koraPayoutValidRows As Long
+    
+    Dim koraPayinDict As Collection, koraPayoutDict As Collection
+    Set koraPayinDict = New Collection: Set koraPayoutDict = New Collection
+    
+    Dim i As Long, k As Long, c As Long, matchedRow As Long
+    Dim matchedPayinCount As Long, unmatchedPayinCount As Long
+    Dim matchedPayoutCount As Long, unmatchedPayoutCount As Long
+    
+    Dim matchedPayinIdx() As Long, unmatchedPayinIdx() As Long
+    Dim matchedPayoutIdx() As Long, unmatchedPayoutIdx() As Long
+    Dim koraPayinMatched() As Boolean, koraPayoutMatched() As Boolean
+    
+    Dim dateOnly As Date, clientRef As String, typeVal As String, procName As String
+    Dim isPayout As Boolean, statusCol As Long
+
+    itcFilePath = Application.GetOpenFilename(Title:="Select ITC Report File (.csv or .xlsx)")
+    If itcFilePath = False Or Trim(CStr(itcFilePath)) = "" Then Reconcile_ITC_Direct = False: Exit Function
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    Set koraPayinWS = masterWB.Sheets("KORA-PAYIN")
+    Set koraPayoutWS = masterWB.Sheets("KORA-PAYOUT")
+    
+    On Error Resume Next
+    Set destPayinWS = masterWB.Sheets("ITC Payin")
+    If destPayinWS Is Nothing Then Set destPayinWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayinWS.Name = "ITC Payin"
+    destPayinWS.Cells.Clear
+    
+    Set destPayoutWS = masterWB.Sheets("ITC Pay-out")
+    If destPayoutWS Is Nothing Then Set destPayoutWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayoutWS.Name = "ITC Pay-out"
+    destPayoutWS.Cells.Clear
+    On Error GoTo ErrorHandler
+
+    Set itcWB = Workbooks.Open(FileName:=CStr(itcFilePath), ReadOnly:=True)
+    On Error Resume Next
+    Set procWS = itcWB.Worksheets("ITC Payin")
+    If procWS Is Nothing Then Set procWS = itcWB.Worksheets(1)
+    On Error GoTo ErrorHandler
+
+    procLastRow = procWS.Cells(procWS.Rows.Count, "G").End(xlUp).Row
+    procLastCol = procWS.Cells(1, procWS.Columns.Count).End(xlToLeft).Column
+    If procLastRow < 2 Then procLastRow = 2
+    If procLastCol < 20 Then procLastCol = 20 ' Col T Date
+
+    procData = procWS.Range(procWS.Cells(1, 1), procWS.Cells(procLastRow, procLastCol)).Value
+    itcWB.Close SaveChanges:=False
+    Set itcWB = Nothing
+    Set procWS = Nothing
+
+    ' Ingest KORA-PAYIN & Build Hash Table
+    koraPayinLastRow = koraPayinWS.Cells(koraPayinWS.Rows.Count, 1).End(xlUp).Row
+    koraPayinLastCol = koraPayinWS.Cells(1, koraPayinWS.Columns.Count).End(xlToLeft).Column
+    If koraPayinLastRow < 2 Then koraPayinLastRow = 2
+    If koraPayinLastCol < 3 Then koraPayinLastCol = 3
+    koraPayinData = koraPayinWS.Range(koraPayinWS.Cells(1, 1), koraPayinWS.Cells(koraPayinLastRow, koraPayinLastCol)).Value
+
+    koraPayinValidRows = koraPayinLastRow
+    For k = 2 To koraPayinLastRow
+        procName = UCase(Trim(CStr(koraPayinData(k, 1)))) & " " & UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayinValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "ITC") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayinData(k, 3))))
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayinDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ' Ingest KORA-PAYOUT & Build Hash Table
+    koraPayoutLastRow = koraPayoutWS.Cells(koraPayoutWS.Rows.Count, 1).End(xlUp).Row
+    koraPayoutLastCol = koraPayoutWS.Cells(1, koraPayoutWS.Columns.Count).End(xlToLeft).Column
+    If koraPayoutLastRow < 2 Then koraPayoutLastRow = 2
+    If koraPayoutLastCol < 5 Then koraPayoutLastCol = 5
+    koraPayoutData = koraPayoutWS.Range(koraPayoutWS.Cells(1, 1), koraPayoutWS.Cells(koraPayoutLastRow, koraPayoutLastCol)).Value
+
+    koraPayoutValidRows = koraPayoutLastRow
+    For k = 2 To koraPayoutLastRow
+        procName = UCase(Trim(CStr(koraPayoutData(k, 1)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 2)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayoutValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "ITC") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayoutData(k, 5))))
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayoutDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ReDim koraPayinMatched(1 To koraPayinValidRows)
+    ReDim koraPayoutMatched(1 To koraPayoutValidRows)
+    ReDim matchedPayinIdx(1 To procLastRow): ReDim unmatchedPayinIdx(1 To procLastRow)
+    ReDim matchedPayoutIdx(1 To procLastRow): ReDim unmatchedPayoutIdx(1 To procLastRow)
+
+    matchedPayinCount = 0: unmatchedPayinCount = 0
+    matchedPayoutCount = 0: unmatchedPayoutCount = 0
+
+    For i = 2 To procLastRow
+        dateOnly = SafeDateText(procData(i, 20)) ' Col T Date
+        
+        If dateOnly >= startDate And dateOnly <= endDate Then
+            clientRef = UCase(Trim(CStr(procData(i, 7)))) ' Col G thirdparty_id
+            typeVal = UCase(Trim(CStr(procData(i, 11))))   ' Col K transaction_type
+            
+            isPayout = (InStr(typeVal, "OUTFLOW") > 0 Or InStr(typeVal, "PAYOUT") > 0)
+            
+            matchedRow = 0
+            If isPayout Then
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    matchedRow = koraPayoutDict(clientRef)
+                    On Error GoTo ErrorHandler
+                End If
+                If matchedRow > 0 Then
+                    koraPayoutMatched(matchedRow) = True
+                    matchedPayoutCount = matchedPayoutCount + 1: matchedPayoutIdx(matchedPayoutCount) = i
+                Else
+                    unmatchedPayoutCount = unmatchedPayoutCount + 1: unmatchedPayoutIdx(unmatchedPayoutCount) = i
+                End If
+            Else
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    matchedRow = koraPayinDict(clientRef)
+                    On Error GoTo ErrorHandler
+                End If
+                If matchedRow > 0 Then
+                    koraPayinMatched(matchedRow) = True
+                    matchedPayinCount = matchedPayinCount + 1: matchedPayinIdx(matchedPayinCount) = i
+                Else
+                    unmatchedPayinCount = unmatchedPayinCount + 1: unmatchedPayinIdx(unmatchedPayinCount) = i
+                End If
+            End If
+        End If
+    Next i
+
+    ' Write ITC Payin
+    WriteProcessorTable destPayinWS, procData, procLastCol, matchedPayinCount, matchedPayinIdx, unmatchedPayinCount, unmatchedPayinIdx, 7, "PAYINS"
+    AddDynamicSums destPayinWS, procData, procLastCol, Array("NET_AMOUNT", "NET AMOUNT")
+
+    ' Write ITC Payout
+    WriteProcessorTable destPayoutWS, procData, procLastCol, matchedPayoutCount, matchedPayoutIdx, unmatchedPayoutCount, unmatchedPayoutIdx, 7, "PAYOUTS"
+    AddDynamicSums destPayoutWS, procData, procLastCol, Array("NET_AMOUNT", "NET AMOUNT")
+
+    ' Update Ledgers
+    UpdateLedgerStatus koraPayinWS, koraPayinData, koraPayinValidRows, koraPayinLastCol, koraPayinMatched, "ITC", 2
+    UpdateLedgerStatus koraPayoutWS, koraPayoutData, koraPayoutValidRows, koraPayoutLastCol, koraPayoutMatched, "ITC", 3
+
+    ' Clean RAM Memory
+    Set koraPayinDict = Nothing: Set koraPayoutDict = Nothing
+    Erase procData: Erase koraPayinData: Erase koraPayoutData
+    Erase matchedPayinIdx: Erase unmatchedPayinIdx: Erase matchedPayoutIdx: Erase unmatchedPayoutIdx
+    Erase koraPayinMatched: Erase koraPayoutMatched
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_ITC_Direct = True
+    Exit Function
+
+ErrorHandler:
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_ITC_Direct = False
+End Function
+
+' -------------------------------------------------------------
+' 3. BROADSPECTRUM ENGINE (Sums amount and calculated fee)
+' -------------------------------------------------------------
+Private Function Reconcile_Broadspectrum_Direct(ByRef masterWB As Workbook, ByVal startDate As Date, ByVal endDate As Date) As Boolean
+    On Error GoTo ErrorHandler
+    
+    Dim bsFilePath As Variant, bsWB As Workbook, procWS As Worksheet
+    Dim koraPayinWS As Worksheet, koraPayoutWS As Worksheet
+    Dim destPayinWS As Worksheet, destPayoutWS As Worksheet
+    
+    Dim procData As Variant, koraPayinData As Variant, koraPayoutData As Variant
+    Dim procLastRow As Long, procLastCol As Long, maxOutCol As Long
+    Dim koraPayinLastRow As Long, koraPayinLastCol As Long, koraPayinValidRows As Long
+    Dim koraPayoutLastRow As Long, koraPayoutLastCol As Long, koraPayoutValidRows As Long
+    
+    Dim koraPayinDict As Collection, koraPayoutDict As Collection
+    Set koraPayinDict = New Collection: Set koraPayoutDict = New Collection
+    
+    Dim i As Long, k As Long, c As Long, outRow As Long, matchedRow As Long
+    Dim matchedPayinCount As Long, unmatchedPayinCount As Long
+    Dim matchedPayoutCount As Long, unmatchedPayoutCount As Long
+    
+    Dim matchedPayinIdx() As Long, unmatchedPayinIdx() As Long
+    Dim matchedPayoutIdx() As Long, unmatchedPayoutIdx() As Long
+    Dim koraPayinMatched() As Boolean, koraPayoutMatched() As Boolean
+    
+    Dim dateOnly As Date, statusVal As String, clientRef As String, typeVal As String, procName As String
+    Dim isPayout As Boolean, statusCol As Long
+    Dim totalOutRows As Long, outArr() As Variant
+
+    bsFilePath = Application.GetOpenFilename(Title:="Select Broadspectrum Report File")
+    If bsFilePath = False Or Trim(CStr(bsFilePath)) = "" Then Reconcile_Broadspectrum_Direct = False: Exit Function
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    Set koraPayinWS = masterWB.Sheets("KORA-PAYIN")
+    Set koraPayoutWS = masterWB.Sheets("KORA-PAYOUT")
+    
+    On Error Resume Next
+    Set destPayinWS = masterWB.Sheets("broadspectrum Payin")
+    If destPayinWS Is Nothing Then Set destPayinWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayinWS.Name = "broadspectrum Payin"
+    destPayinWS.Cells.Clear
+    
+    Set destPayoutWS = masterWB.Sheets("broadspectrum Pay-out")
+    If destPayoutWS Is Nothing Then Set destPayoutWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayoutWS.Name = "broadspectrum Pay-out"
+    destPayoutWS.Cells.Clear
+    On Error GoTo ErrorHandler
+
+    Set bsWB = Workbooks.Open(FileName:=CStr(bsFilePath), ReadOnly:=True)
+    On Error Resume Next
+    Set procWS = bsWB.Worksheets("broadspectrum Payin")
+    If procWS Is Nothing Then Set procWS = bsWB.Worksheets(1)
+    On Error GoTo ErrorHandler
+
+    procLastRow = procWS.Cells(procWS.Rows.Count, "B").End(xlUp).Row
+    procLastCol = procWS.Cells(1, procWS.Columns.Count).End(xlToLeft).Column
+    If procLastRow < 2 Then procLastRow = 2
+    If procLastCol < 18 Then procLastCol = 18
+
+    procData = procWS.Range(procWS.Cells(1, 1), procWS.Cells(procLastRow, procLastCol)).Value
+    bsWB.Close SaveChanges:=False
+    Set bsWB = Nothing
+    Set procWS = Nothing
+
+    ' Ingest KORA-PAYIN & Hash Table
+    koraPayinLastRow = koraPayinWS.Cells(koraPayinWS.Rows.Count, 1).End(xlUp).Row
+    koraPayinLastCol = koraPayinWS.Cells(1, koraPayinWS.Columns.Count).End(xlToLeft).Column
+    If koraPayinLastRow < 2 Then koraPayinLastRow = 2
+    If koraPayinLastCol < 3 Then koraPayinLastCol = 3
+    koraPayinData = koraPayinWS.Range(koraPayinWS.Cells(1, 1), koraPayinWS.Cells(koraPayinLastRow, koraPayinLastCol)).Value
+
+    koraPayinValidRows = koraPayinLastRow
+    For k = 2 To koraPayinLastRow
+        procName = UCase(Trim(CStr(koraPayinData(k, 1)))) & " " & UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayinValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "BROADSPECTRUM") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayinData(k, 3))))
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayinDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ' Ingest KORA-PAYOUT & Hash Table
+    koraPayoutLastRow = koraPayoutWS.Cells(koraPayoutWS.Rows.Count, 1).End(xlUp).Row
+    koraPayoutLastCol = koraPayoutWS.Cells(1, koraPayoutWS.Columns.Count).End(xlToLeft).Column
+    If koraPayoutLastRow < 2 Then koraPayoutLastRow = 2
+    If koraPayoutLastCol < 5 Then koraPayoutLastCol = 5
+    koraPayoutData = koraPayoutWS.Range(koraPayoutWS.Cells(1, 1), koraPayoutWS.Cells(koraPayoutLastRow, koraPayoutLastCol)).Value
+
+    koraPayoutValidRows = koraPayoutLastRow
+    For k = 2 To koraPayoutLastRow
+        procName = UCase(Trim(CStr(koraPayoutData(k, 1)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 2)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayoutValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "BROADSPECTRUM") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayoutData(k, 5))))
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayoutDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ReDim koraPayinMatched(1 To koraPayinValidRows)
+    ReDim koraPayoutMatched(1 To koraPayoutValidRows)
+    ReDim matchedPayinIdx(1 To procLastRow): ReDim unmatchedPayinIdx(1 To procLastRow)
+    ReDim matchedPayoutIdx(1 To procLastRow): ReDim unmatchedPayoutIdx(1 To procLastRow)
+
+    matchedPayinCount = 0: unmatchedPayinCount = 0
+    matchedPayoutCount = 0: unmatchedPayoutCount = 0
+
+    For i = 2 To procLastRow
+        dateOnly = SafeDateText(procData(i, 10)) ' Explicitly Column J
+        statusVal = Trim(CStr(procData(i, 8)))   ' Col H Status
+        
+        If (UCase(statusVal) = "SUCCESS" Or UCase(statusVal) = "SUCCESSFUL") And dateOnly >= startDate And dateOnly <= endDate Then
+            clientRef = UCase(Trim(CStr(procData(i, 2)))) ' Col B Reference
+            typeVal = UCase(Trim(CStr(procData(i, 3))))     ' Col C Transaction Type
+            
+            isPayout = (InStr(typeVal, "DISBURSEMENT") > 0 Or InStr(typeVal, "PAYOUT") > 0)
+            
+            matchedRow = 0
+            If isPayout Then
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    matchedRow = koraPayoutDict(clientRef)
+                    On Error GoTo ErrorHandler
+                End If
+                If matchedRow > 0 Then
+                    koraPayoutMatched(matchedRow) = True
+                    matchedPayoutCount = matchedPayoutCount + 1: matchedPayoutIdx(matchedPayoutCount) = i
+                Else
+                    unmatchedPayoutCount = unmatchedPayoutCount + 1: unmatchedPayoutIdx(unmatchedPayoutCount) = i
+                End If
+            Else
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    matchedRow = koraPayinDict(clientRef)
+                    On Error GoTo ErrorHandler
+                End If
+                If matchedRow > 0 Then
+                    koraPayinMatched(matchedRow) = True
+                    matchedPayinCount = matchedPayinCount + 1: matchedPayinIdx(matchedPayinCount) = i
+                Else
+                    unmatchedPayinCount = unmatchedPayinCount + 1: unmatchedPayinIdx(unmatchedPayinCount) = i
+                End If
+            End If
+        End If
+    Next i
+
+    ' --- Write Broadspectrum Payin (Calculates Fee strictly in Column X) ---
+    totalOutRows = 1 + matchedPayinCount + IIf(unmatchedPayinCount > 0, 10 + unmatchedPayinCount, 0)
+    If totalOutRows > 1 Then
+        maxOutCol = procLastCol + 1
+        If maxOutCol < 24 Then maxOutCol = 24 ' Ensure width covers Column X
+        
+        ReDim outArr(1 To totalOutRows, 1 To maxOutCol)
+        For c = 1 To procLastCol: outArr(1, c) = procData(1, c): Next c
+        outArr(1, procLastCol + 1) = "Formatted Ref"
+        outArr(1, 24) = "Calculated Fee" ' Header at Column X
+        
+        outRow = 2
+        For i = 1 To matchedPayinCount
+            For c = 1 To procLastCol: outArr(outRow, c) = procData(matchedPayinIdx(i), c): Next c
+            outArr(outRow, 24) = "=IF(R" & outRow & "<=40, 0.5, MIN(R" & outRow & "*1.45%, 25))"
+            outRow = outRow + 1
+        Next i
+        
+        If unmatchedPayinCount > 0 Then
+            outRow = outRow + 5
+            outArr(outRow, 1) = "--- UNMATCHED PROCESSOR PAYINS BELOW ---"
+            outRow = outRow + 5
+            For i = 1 To unmatchedPayinCount
+                For c = 1 To procLastCol: outArr(outRow, c) = procData(unmatchedPayinIdx(i), c): Next c
+                clientRef = Trim(CStr(procData(unmatchedPayinIdx(i), 2)))
+                If clientRef <> "" Then outArr(outRow, procLastCol + 1) = "''" & clientRef & "',"
+                outArr(outRow, 24) = "=IF(R" & outRow & "<=40, 0.5, MIN(R" & outRow & "*1.45%, 25))"
+                outRow = outRow + 1
+            Next i
+        End If
+        destPayinWS.Range(destPayinWS.Cells(1, 1), destPayinWS.Cells(totalOutRows, maxOutCol)).Value = outArr
+        destPayinWS.Rows(1).Font.Bold = True
+        Erase outArr
+        AddDynamicSums destPayinWS, procData, maxOutCol, Array("AMOUNT", "CALCULATED FEE")
+    End If
+
+    ' --- Write Broadspectrum Payout ---
+    WriteProcessorTable destPayoutWS, procData, procLastCol, matchedPayoutCount, matchedPayoutIdx, unmatchedPayoutCount, unmatchedPayoutIdx, 2, "PAYOUTS"
+    AddDynamicSums destPayoutWS, procData, procLastCol, Array("AMOUNT")
+
+    ' Update Ledgers
+    UpdateLedgerStatus koraPayinWS, koraPayinData, koraPayinValidRows, koraPayinLastCol, koraPayinMatched, "BROADSPECTRUM", 2
+    UpdateLedgerStatus koraPayoutWS, koraPayoutData, koraPayoutValidRows, koraPayoutLastCol, koraPayoutMatched, "BROADSPECTRUM", 3
+
+    ' Clean RAM Memory
+    Set koraPayinDict = Nothing: Set koraPayoutDict = Nothing
+    Erase procData: Erase koraPayinData: Erase koraPayoutData
+    Erase matchedPayinIdx: Erase unmatchedPayinIdx: Erase matchedPayoutIdx: Erase unmatchedPayoutIdx
+    Erase koraPayinMatched: Erase koraPayoutMatched
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Broadspectrum_Direct = True
+    Exit Function
+
+ErrorHandler:
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Broadspectrum_Direct = False
+End Function
+
+' -------------------------------------------------------------
+' 4. FINCRA ENGINE (Sums Transaction Amount and Commission)
+' -------------------------------------------------------------
+Private Function Reconcile_Fincra_Direct(ByRef masterWB As Workbook, ByVal startDate As Date, ByVal endDate As Date) As Boolean
+    On Error GoTo ErrorHandler
+    
+    Dim fincraFilePath As Variant, fincraWB As Workbook, procWS As Worksheet
+    Dim koraPayinWS As Worksheet, koraPayoutWS As Worksheet
+    Dim destPayinWS As Worksheet, destPayoutWS As Worksheet
+    
+    Dim procData As Variant, koraPayinData As Variant, koraPayoutData As Variant
+    Dim procLastRow As Long, procLastCol As Long
+    Dim koraPayinLastRow As Long, koraPayinLastCol As Long, koraPayinValidRows As Long
+    Dim koraPayoutLastRow As Long, koraPayoutLastCol As Long, koraPayoutValidRows As Long
+    
+    Dim koraPayinDict As Collection, koraPayoutDict As Collection
+    Set koraPayinDict = New Collection: Set koraPayoutDict = New Collection
+    
+    Dim seenRefs As Collection
+    Set seenRefs = New Collection
+    
+    Dim i As Long, k As Long, c As Long, matchedRow As Long
+    Dim matchedPayinCount As Long, unmatchedPayinCount As Long
+    Dim matchedPayoutCount As Long, unmatchedPayoutCount As Long
+    
+    Dim matchedPayinIdx() As Long, unmatchedPayinIdx() As Long
+    Dim matchedPayoutIdx() As Long, unmatchedPayoutIdx() As Long
+    Dim koraPayinMatched() As Boolean, koraPayoutMatched() As Boolean
+    
+    Dim dateOnly As Date, clientRef As String, typeVal As String, procName As String
+    Dim isPayout As Boolean, refKey As String, statusCol As Long
+
+    fincraFilePath = Application.GetOpenFilename(Title:="Select Fincra Report File")
+    If fincraFilePath = False Or Trim(CStr(fincraFilePath)) = "" Then Reconcile_Fincra_Direct = False: Exit Function
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    Set koraPayinWS = masterWB.Sheets("KORA-PAYIN")
+    Set koraPayoutWS = masterWB.Sheets("KORA-PAYOUT")
+    
+    On Error Resume Next
+    Set destPayinWS = masterWB.Sheets("Fincra Payin")
+    If destPayinWS Is Nothing Then Set destPayinWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayinWS.Name = "Fincra Payin"
+    destPayinWS.Cells.Clear
+    
+    Set destPayoutWS = masterWB.Sheets("Fincra Payout")
+    If destPayoutWS Is Nothing Then Set destPayoutWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayoutWS.Name = "Fincra Payout"
+    destPayoutWS.Cells.Clear
+    On Error GoTo ErrorHandler
+
+    Set fincraWB = Workbooks.Open(FileName:=CStr(fincraFilePath), ReadOnly:=True)
+    On Error Resume Next
+    Set procWS = fincraWB.Worksheets("Fincra Payin")
+    If procWS Is Nothing Then Set procWS = fincraWB.Worksheets(1)
+    On Error GoTo ErrorHandler
+
+    If procWS Is Nothing Then
+        fincraWB.Close SaveChanges:=False
+        Reconcile_Fincra_Direct = False
+        Exit Function
+    End If
+
+    procLastRow = procWS.Cells(procWS.Rows.Count, "K").End(xlUp).Row
+    procLastCol = procWS.Cells(1, procWS.Columns.Count).End(xlToLeft).Column
+    If procLastRow < 2 Then procLastRow = 2
+    If procLastCol < 11 Then procLastCol = 11
+
+    procData = procWS.Range(procWS.Cells(1, 1), procWS.Cells(procLastRow, procLastCol)).Value
+    fincraWB.Close SaveChanges:=False
+    Set fincraWB = Nothing
+    Set procWS = Nothing
+
+    ' Ingest KORA-PAYIN & Hash Table
+    koraPayinLastRow = koraPayinWS.Cells(koraPayinWS.Rows.Count, 1).End(xlUp).Row
+    koraPayinLastCol = koraPayinWS.Cells(1, koraPayinWS.Columns.Count).End(xlToLeft).Column
+    If koraPayinLastRow < 2 Then koraPayinLastRow = 2
+    If koraPayinLastCol < 3 Then koraPayinLastCol = 3
+    koraPayinData = koraPayinWS.Range(koraPayinWS.Cells(1, 1), koraPayinWS.Cells(koraPayinLastRow, koraPayinLastCol)).Value
+
+    koraPayinValidRows = koraPayinLastRow
+    For k = 2 To koraPayinLastRow
+        procName = UCase(Trim(CStr(koraPayinData(k, 1)))) & " " & UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayinValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "FINCRA") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayinData(k, 3))))
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayinDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ' Ingest KORA-PAYOUT & Hash Table
+    koraPayoutLastRow = koraPayoutWS.Cells(koraPayoutWS.Rows.Count, 1).End(xlUp).Row
+    koraPayoutLastCol = koraPayoutWS.Cells(1, koraPayoutWS.Columns.Count).End(xlToLeft).Column
+    If koraPayoutLastRow < 2 Then koraPayoutLastRow = 2
+    If koraPayoutLastCol < 5 Then koraPayoutLastCol = 5
+    koraPayoutData = koraPayoutWS.Range(koraPayoutWS.Cells(1, 1), koraPayoutWS.Cells(koraPayoutLastRow, koraPayoutLastCol)).Value
+
+    koraPayoutValidRows = koraPayoutLastRow
+    For k = 2 To koraPayoutLastRow
+        procName = UCase(Trim(CStr(koraPayoutData(k, 1)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 2)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayoutValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "FINCRA") > 0 Then
+            clientRef = UCase(Trim(CStr(koraPayoutData(k, 5))))
+            If clientRef <> "" Then
+                On Error Resume Next
+                koraPayoutDict.Add k, clientRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ReDim koraPayinMatched(1 To koraPayinValidRows)
+    ReDim koraPayoutMatched(1 To koraPayoutValidRows)
+    ReDim matchedPayinIdx(1 To procLastRow): ReDim unmatchedPayinIdx(1 To procLastRow)
+    ReDim matchedPayoutIdx(1 To procLastRow): ReDim unmatchedPayoutIdx(1 To procLastRow)
+
+    matchedPayinCount = 0: unmatchedPayinCount = 0
+    matchedPayoutCount = 0: unmatchedPayoutCount = 0
+
+    For i = 2 To procLastRow
+        dateOnly = SafeDateText(procData(i, 2)) ' Column B Date
+        
+        If dateOnly >= startDate And dateOnly <= endDate Then
+            clientRef = UCase(Trim(CStr(procData(i, 11)))) ' Col K Merchant Description
+            typeVal = UCase(Trim(CStr(procData(i, 7))))     ' Col G Transaction Type
+            
+            isPayout = (InStr(typeVal, "DEBIT") > 0)
+            
+            matchedRow = 0
+            If isPayout Then
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    refKey = seenRefs(clientRef)
+                    If Err.Number <> 0 Then
+                        Err.Clear
+                        seenRefs.Add clientRef, clientRef
+                        
+                        matchedRow = koraPayoutDict(clientRef)
+                        If matchedRow > 0 Then
+                            koraPayoutMatched(matchedRow) = True
+                            matchedPayoutCount = matchedPayoutCount + 1: matchedPayoutIdx(matchedPayoutCount) = i
+                        Else
+                            unmatchedPayoutCount = unmatchedPayoutCount + 1: unmatchedPayoutIdx(unmatchedPayoutCount) = i
+                        End If
+                    End If
+                    On Error GoTo ErrorHandler
+                End If
+            Else
+                If clientRef <> "" Then
+                    On Error Resume Next
+                    matchedRow = koraPayinDict(clientRef)
+                    On Error GoTo ErrorHandler
+                    
+                    If matchedRow > 0 Then
+                        koraPayinMatched(matchedRow) = True
+                        matchedPayinCount = matchedPayinCount + 1: matchedPayinIdx(matchedPayinCount) = i
+                    Else
+                        unmatchedPayinCount = unmatchedPayinCount + 1: unmatchedPayinIdx(unmatchedPayinCount) = i
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    ' Write Fincra Payin
+    WriteProcessorTable destPayinWS, procData, procLastCol, matchedPayinCount, matchedPayinIdx, unmatchedPayinCount, unmatchedPayinIdx, 11, "PAYINS"
+    AddDynamicSums destPayinWS, procData, procLastCol, Array("TRANSACTION AMOUNT", "COMMISSION")
+
+    ' Write Fincra Payout
+    WriteProcessorTable destPayoutWS, procData, procLastCol, matchedPayoutCount, matchedPayoutIdx, unmatchedPayoutCount, unmatchedPayoutIdx, 11, "PAYOUTS"
+    AddDynamicSums destPayoutWS, procData, procLastCol, Array("TRANSACTION AMOUNT", "COMMISSION")
+
+    ' Update Ledgers
+    UpdateLedgerStatus koraPayinWS, koraPayinData, koraPayinValidRows, koraPayinLastCol, koraPayinMatched, "FINCRA", 2
+    UpdateLedgerStatus koraPayoutWS, koraPayoutData, koraPayoutValidRows, koraPayoutLastCol, koraPayoutMatched, "FINCRA", 3
+
+    ' Clean RAM Memory
+    Set seenRefs = Nothing: Set koraPayinDict = Nothing: Set koraPayoutDict = Nothing
+    Erase procData: Erase koraPayinData: Erase koraPayoutData
+    Erase matchedPayinIdx: Erase unmatchedPayinIdx: Erase matchedPayoutIdx: Erase unmatchedPayoutIdx
+    Erase koraPayinMatched: Erase koraPayoutMatched
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Fincra_Direct = True
+    Exit Function
+
+ErrorHandler:
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Fincra_Direct = False
+End Function
+
+' -------------------------------------------------------------
+' 5. NSANO ENGINE (Sums Amount_GHC and charge across all tabs)
+' -------------------------------------------------------------
+Private Function Reconcile_Nsano_Direct(ByRef masterWB As Workbook, ByVal startDate As Date, ByVal endDate As Date) As Boolean
+    On Error GoTo ErrorHandler
+    
+    Dim filePaths(1 To 3) As Variant, fileTitles(1 To 3) As String
+    Dim targetPayinWS As Worksheet, targetPayoutWS As Worksheet
+    Dim destPayinWS As Worksheet, destBnaWS As Worksheet, destPayoutWS As Worksheet, destRemPayoutWS As Worksheet
+    Dim koraPayinWS As Worksheet, koraPayoutWS As Worksheet
+    
+    Dim koraPayinData As Variant, koraPayoutData As Variant
+    Dim koraPayinLastRow As Long, koraPayinLastCol As Long, koraPayinValidRows As Long
+    Dim koraPayoutLastRow As Long, koraPayoutLastCol As Long, koraPayoutValidRows As Long
+    Dim koraPayinMatched() As Boolean, koraPayoutMatched() As Boolean
+    
+    Dim koraPayinDict As Collection, koraPayoutDict As Collection
+    Set koraPayinDict = New Collection: Set koraPayoutDict = New Collection
+    
+    Dim procWB As Workbook, procWS As Worksheet, procData As Variant
+    Dim procLastRow As Long, procLastCol As Long
+    Dim matchedPayinIdx() As Long, unmatchedPayinIdx() As Long
+    Dim matchedPayoutIdx() As Long, unmatchedPayoutIdx() As Long
+    Dim matchedPayinCount As Long, unmatchedPayinCount As Long
+    Dim matchedPayoutCount As Long, unmatchedPayoutCount As Long
+    
+    Dim f As Integer, i As Long, k As Long, c As Long, outRow As Long, totalOutRows As Long, rowIdx As Long, matchedRow As Long
+    Dim dateOnly As Date, statusVal As String, cleanRef As String, rawRef As String, sendingHseId As String, procName As String
+    Dim isPayout As Boolean, statusCol As Long
+    Dim outArr() As Variant, refCol As Long
+
+    fileTitles(1) = "NORMAL NSANO Report File"
+    fileTitles(2) = "NSANO BNA Report File"
+    fileTitles(3) = "NSANO REMITTANCE Report File"
+
+    ' Setup Target Sheets
+    Set koraPayinWS = masterWB.Sheets("KORA-PAYIN")
+    Set koraPayoutWS = masterWB.Sheets("KORA-PAYOUT")
+    
+    On Error Resume Next
+    Set destPayinWS = masterWB.Sheets("Nsano Payin")
+    If destPayinWS Is Nothing Then Set destPayinWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayinWS.Name = "Nsano Payin"
+    destPayinWS.Cells.Clear
+    
+    Set destBnaWS = masterWB.Sheets("Nsano BNA Payin")
+    If destBnaWS Is Nothing Then Set destBnaWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destBnaWS.Name = "Nsano BNA Payin"
+    destBnaWS.Cells.Clear
+    
+    Set destPayoutWS = masterWB.Sheets("Nsano Pay-out")
+    If destPayoutWS Is Nothing Then Set destPayoutWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destPayoutWS.Name = "Nsano Pay-out"
+    destPayoutWS.Cells.Clear
+
+    Set destRemPayoutWS = masterWB.Sheets("Nsano Remittance Pay-out")
+    If destRemPayoutWS Is Nothing Then Set destRemPayoutWS = masterWB.Sheets.Add(After:=masterWB.Sheets(masterWB.Sheets.Count)): destRemPayoutWS.Name = "Nsano Remittance Pay-out"
+    destRemPayoutWS.Cells.Clear
+    On Error GoTo ErrorHandler
+
+    ' Ingest KORA-PAYIN & Hash Table
+    koraPayinLastRow = koraPayinWS.Cells(koraPayinWS.Rows.Count, 1).End(xlUp).Row
+    koraPayinLastCol = koraPayinWS.Cells(1, koraPayinWS.Columns.Count).End(xlToLeft).Column
+    If koraPayinLastRow < 2 Then koraPayinLastRow = 2
+    If koraPayinLastCol < 3 Then koraPayinLastCol = 3
+    koraPayinData = koraPayinWS.Range(koraPayinWS.Cells(1, 1), koraPayinWS.Cells(koraPayinLastRow, koraPayinLastCol)).Value
+
+    koraPayinValidRows = koraPayinLastRow
+    For k = 2 To koraPayinLastRow
+        procName = UCase(Trim(CStr(koraPayinData(k, 1)))) & " " & UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayinValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayinData(k, 2))))
+        If InStr(procName, "NSANO") > 0 Then
+            cleanRef = UCase(Trim(CStr(koraPayinData(k, 3))))
+            If cleanRef <> "" Then
+                On Error Resume Next
+                koraPayinDict.Add k, cleanRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ' Ingest KORA-PAYOUT & Hash Table
+    koraPayoutLastRow = koraPayoutWS.Cells(koraPayoutWS.Rows.Count, 1).End(xlUp).Row
+    koraPayoutLastCol = koraPayoutWS.Cells(1, koraPayoutWS.Columns.Count).End(xlToLeft).Column
+    If koraPayoutLastRow < 2 Then koraPayoutLastRow = 2
+    If koraPayoutLastCol < 5 Then koraPayoutLastCol = 5
+    koraPayoutData = koraPayoutWS.Range(koraPayoutWS.Cells(1, 1), koraPayoutWS.Cells(koraPayoutLastRow, koraPayoutLastCol)).Value
+
+    koraPayoutValidRows = koraPayoutLastRow
+    For k = 2 To koraPayoutLastRow
+        procName = UCase(Trim(CStr(koraPayoutData(k, 1)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 2)))) & " " & UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "TOTAL") > 0 Or InStr(procName, "PIVOT") > 0 Or InStr(procName, "GRAND") > 0 Then
+            koraPayoutValidRows = k - 1: Exit For
+        End If
+        procName = UCase(Trim(CStr(koraPayoutData(k, 3))))
+        If InStr(procName, "NSANO") > 0 Then
+            cleanRef = UCase(Trim(CStr(koraPayoutData(k, 5))))
+            If cleanRef <> "" Then
+                On Error Resume Next
+                koraPayoutDict.Add k, cleanRef
+                On Error GoTo ErrorHandler
+            End If
+        End If
+    Next k
+
+    ReDim koraPayinMatched(1 To koraPayinValidRows)
+    ReDim koraPayoutMatched(1 To koraPayoutValidRows)
+
+    ' Process 3 Files Sequentially
+    For f = 1 To 3
+        MsgBox "NSANO STEP " & f & " OF 3:" & vbCrLf & "Please select the " & fileTitles(f) & " on the next screen.", vbInformation, "Nsano Step " & f
+        filePaths(f) = Application.GetOpenFilename(Title:="Select " & fileTitles(f))
+        
+        If filePaths(f) <> False And Trim(CStr(filePaths(f))) <> "" Then
+            
+            Select Case f
+                Case 1: Set targetPayinWS = destPayinWS: Set targetPayoutWS = destPayoutWS
+                Case 2: Set targetPayinWS = destBnaWS: Set targetPayoutWS = Nothing
+                Case 3: Set targetPayinWS = Nothing: Set targetPayoutWS = destRemPayoutWS
+            End Select
+
+            Set procWB = Workbooks.Open(FileName:=CStr(filePaths(f)), ReadOnly:=True)
+            On Error Resume Next
+            Set procWS = procWB.Worksheets(1)
+            On Error GoTo ErrorHandler
+
+            If Not procWS Is Nothing Then
+                procLastRow = procWS.Cells(procWS.Rows.Count, 1).End(xlUp).Row
+                procLastCol = procWS.Cells(1, procWS.Columns.Count).End(xlToLeft).Column
+                If procLastRow < 2 Then procLastRow = 2
+                If procLastCol < 20 Then procLastCol = 20
+
+                procData = procWS.Range(procWS.Cells(1, 1), procWS.Cells(procLastRow, procLastCol)).Value
+                procWB.Close SaveChanges:=False
+                Set procWB = Nothing
+                Set procWS = Nothing
+
+                ReDim matchedPayinIdx(1 To procLastRow): ReDim unmatchedPayinIdx(1 To procLastRow)
+                ReDim matchedPayoutIdx(1 To procLastRow): ReDim unmatchedPayoutIdx(1 To procLastRow)
+
+                matchedPayinCount = 0: unmatchedPayinCount = 0
+                matchedPayoutCount = 0: unmatchedPayoutCount = 0
+
+                For i = 2 To procLastRow
+                    dateOnly = SafeDateText(procData(i, 1)) ' Col A DateTime
+                    statusVal = Trim(CStr(procData(i, 20)))  ' Col T result
+                    
+                    If (UCase(statusVal) = "SUCCESSFUL" Or UCase(statusVal) = "SUCCESS") And dateOnly >= startDate And dateOnly <= endDate Then
+                        sendingHseId = UCase(Trim(CStr(procData(i, 9)))) ' Col I SendingHse_ID
+                        
+                        Select Case f
+                            Case 1 ' Normal Nsano: Payout if Col I starts with KORAPAY
+                                isPayout = (Left(sendingHseId, 7) = "KORAPAY")
+                                If isPayout Then refCol = 9 Else refCol = 16
+                            Case 2 ' Nsano BNA
+                                isPayout = False
+                                refCol = 16
+                            Case 3 ' Nsano Remittance
+                                isPayout = True
+                                refCol = 9
+                        End Select
+
+                        rawRef = Trim(CStr(procData(i, refCol)))
+                        cleanRef = StripNsanoPrefix(rawRef)
+
+                        matchedRow = 0
+                        If isPayout Then
+                            If cleanRef <> "" Then
+                                On Error Resume Next
+                                matchedRow = koraPayoutDict(cleanRef)
+                                On Error GoTo ErrorHandler
+                            End If
+                            If matchedRow > 0 Then
+                                koraPayoutMatched(matchedRow) = True
+                                matchedPayoutCount = matchedPayoutCount + 1: matchedPayoutIdx(matchedPayoutCount) = i
+                            Else
+                                unmatchedPayoutCount = unmatchedPayoutCount + 1: unmatchedPayoutIdx(unmatchedPayoutCount) = i
+                            End If
+                        Else
+                            If cleanRef <> "" Then
+                                On Error Resume Next
+                                matchedRow = koraPayinDict(cleanRef)
+                                On Error GoTo ErrorHandler
+                            End If
+                            If matchedRow > 0 Then
+                                koraPayinMatched(matchedRow) = True
+                                matchedPayinCount = matchedPayinCount + 1: matchedPayinIdx(matchedPayinCount) = i
+                            Else
+                                unmatchedPayinCount = unmatchedPayinCount + 1: unmatchedPayinIdx(unmatchedPayinCount) = i
+                            End If
+                        End If
+                    End If
+                Next i
+
+                ' Write Output Payins & Add Sums
+                If Not targetPayinWS Is Nothing And (matchedPayinCount > 0 Or unmatchedPayinCount > 0) Then
+                    WriteNsanoTable targetPayinWS, procData, procLastCol, matchedPayinCount, matchedPayinIdx, unmatchedPayinCount, unmatchedPayinIdx, 16, "PAYINS"
+                    AddDynamicSums targetPayinWS, procData, procLastCol, Array("AMOUNT_GHC", "AMOUNT GHC", "CHARGE")
+                End If
+
+                ' Write Output Payouts & Add Sums
+                If Not targetPayoutWS Is Nothing And (matchedPayoutCount > 0 Or unmatchedPayoutCount > 0) Then
+                    WriteNsanoTable targetPayoutWS, procData, procLastCol, matchedPayoutCount, matchedPayoutIdx, unmatchedPayoutCount, unmatchedPayoutIdx, 9, "PAYOUTS"
+                    AddDynamicSums targetPayoutWS, procData, procLastCol, Array("AMOUNT_GHC", "AMOUNT GHC", "CHARGE")
+                End If
+
+                ' Clean RAM Memory for pass
+                Erase procData
+                Erase matchedPayinIdx: Erase unmatchedPayinIdx
+                Erase matchedPayoutIdx: Erase unmatchedPayoutIdx
+            End If
+        End If
+        DoEvents
+    Next f
+
+    ' Update Ledger Statuses
+    UpdateLedgerStatus koraPayinWS, koraPayinData, koraPayinValidRows, koraPayinLastCol, koraPayinMatched, "NSANO", 2
+    UpdateLedgerStatus koraPayoutWS, koraPayoutData, koraPayoutValidRows, koraPayoutLastCol, koraPayoutMatched, "NSANO", 3
+
+    ' Clean RAM & Dictionaries
+    Set koraPayinDict = Nothing: Set koraPayoutDict = Nothing
+    Erase koraPayinData: Erase koraPayoutData
+    Erase koraPayinMatched: Erase koraPayoutMatched
+
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Nsano_Direct = True
+    Exit Function
+
+ErrorHandler:
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Reconcile_Nsano_Direct = False
+End Function
+
+' -------------------------------------------------------------
+' COMMON HELPER ROUTINES (Table Writing, Dynamic Sums & Ledgers)
+' -------------------------------------------------------------
+
+' Helper: Write Standard Output Table
+Private Sub WriteProcessorTable(ByRef destWS As Worksheet, ByRef procData As Variant, ByVal procLastCol As Long, _
+                                ByVal matchCount As Long, ByRef matchedIdx() As Long, _
+                                ByVal unmatchCount As Long, ByRef unmatchedIdx() As Long, _
+                                ByVal refColIdx As Long, ByVal label As String)
+
+    Dim totalOutRows As Long, outRow As Long, i As Long, c As Long, clientRef As String, outArr() As Variant
+
+    totalOutRows = 1 + matchCount + IIf(unmatchCount > 0, 10 + unmatchCount, 0)
+    If totalOutRows <= 1 Then Exit Sub
+
+    ReDim outArr(1 To totalOutRows, 1 To procLastCol + 1)
+    
+    ' Header Row
+    For c = 1 To procLastCol: outArr(1, c) = procData(1, c): Next c
+    outArr(1, procLastCol + 1) = "Formatted Ref"
+    
+    outRow = 2
+    For i = 1 To matchCount
+        For c = 1 To procLastCol: outArr(outRow, c) = procData(matchedIdx(i), c): Next c
+        outRow = outRow + 1
+    Next i
+    
+    If unmatchCount > 0 Then
+        outRow = outRow + 5
+        outArr(outRow, 1) = "--- UNMATCHED PROCESSOR " & label & " BELOW ---"
+        outRow = outRow + 5
+        For i = 1 To unmatchCount
+            For c = 1 To procLastCol: outArr(outRow, c) = procData(unmatchedIdx(i), c): Next c
+            clientRef = Trim(CStr(procData(unmatchedIdx(i), refColIdx)))
+            If clientRef <> "" Then outArr(outRow, procLastCol + 1) = "''" & clientRef & "',"
+            outRow = outRow + 1
+        Next i
+    End If
+
+    destWS.Range(destWS.Cells(1, 1), destWS.Cells(totalOutRows, procLastCol + 1)).Value = outArr
+    destWS.Rows(1).Font.Bold = True
+    Erase outArr
+End Sub
+
+' Helper: Write Nsano Output Table
+Private Sub WriteNsanoTable(ByRef destWS As Worksheet, ByRef procData As Variant, ByVal procLastCol As Long, _
+                            ByVal matchCount As Long, ByRef matchedIdx() As Long, _
+                            ByVal unmatchCount As Long, ByRef unmatchedIdx() As Long, _
+                            ByVal refColIdx As Long, ByVal label As String)
+
+    Dim totalOutRows As Long, outRow As Long, i As Long, c As Long, rowIdx As Long, cleanRef As String, outArr() As Variant
+
+    totalOutRows = 1 + matchCount + IIf(unmatchCount > 0, 10 + unmatchCount, 0)
+    If totalOutRows <= 1 Then Exit Sub
+
+    ReDim outArr(1 To totalOutRows, 1 To procLastCol + 1)
+    
+    For c = 1 To procLastCol: outArr(1, c) = procData(1, c): Next c
+    outArr(1, procLastCol + 1) = "Formatted Ref"
+    
+    outRow = 2
+    For i = 1 To matchCount
+        rowIdx = matchedIdx(i)
+        For c = 1 To procLastCol: outArr(outRow, c) = procData(rowIdx, c): Next c
+        cleanRef = StripNsanoPrefix(CStr(procData(rowIdx, refColIdx)))
+        If cleanRef <> "" Then outArr(outRow, procLastCol + 1) = "''" & cleanRef & "',"
+        outRow = outRow + 1
+    Next i
+    
+    If unmatchCount > 0 Then
+        outRow = outRow + 5
+        outArr(outRow, 1) = "--- UNMATCHED PROCESSOR " & label & " BELOW ---"
+        outRow = outRow + 5
+        For i = 1 To unmatchCount
+            rowIdx = unmatchedIdx(i)
+            For c = 1 To procLastCol: outArr(outRow, c) = procData(rowIdx, c): Next c
+            cleanRef = StripNsanoPrefix(CStr(procData(rowIdx, refColIdx)))
+            If cleanRef <> "" Then outArr(outRow, procLastCol + 1) = "''" & cleanRef & "',"
+            outRow = outRow + 1
+        Next i
+    End If
+
+    destWS.Range(destWS.Cells(1, 1), destWS.Cells(totalOutRows, procLastCol + 1)).Value = outArr
+    destWS.Rows(1).Font.Bold = True
+    Erase outArr
+End Sub
+
+' Helper: Add Excel Dynamic SUM Formulas at the Bottom of Tables
+Private Sub AddDynamicSums(ByRef ws As Worksheet, ByRef procData As Variant, ByVal maxCol As Long, ByVal targetHeaderNames As Variant)
+    Dim c As Long, h As Long, lastRow As Long, totalRow As Long
+    Dim colHeader As String, targetHeader As String, colLetter As String
+    Dim unmatchedHeaderRow As Long, matchedEndRow As Long, unmatchedStartRow As Long
+    
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lastRow < 2 Then Exit Sub
+
+    ' Find Unmatched Section Row
+    unmatchedHeaderRow = 0
+    For c = 2 To lastRow
+        If InStr(UCase(CStr(ws.Cells(c, 1).Value)), "UNMATCHED") > 0 Then
+            unmatchedHeaderRow = c
+            Exit For
+        End If
+    Next c
+
+    ' Iterate through target headers
+    For h = LBound(targetHeaderNames) To UBound(targetHeaderNames)
+        targetHeader = UCase(Trim(CStr(targetHeaderNames(h))))
+        
+        For c = 1 To maxCol
+            colHeader = UCase(Trim(CStr(ws.Cells(1, c).Value)))
+            
+            If colHeader = targetHeader And colHeader <> "" Then
+                colLetter = GetColLetter(c)
+                
+                If unmatchedHeaderRow = 0 Then
+                    ' Case 1: All rows are Matched
+                    totalRow = lastRow + 2
+                    ws.Cells(totalRow, 1).Value = "TOTAL"
+                    ws.Cells(totalRow, 1).Font.Bold = True
+                    ws.Cells(totalRow, c).Formula = "=SUM(" & colLetter & "2:" & colLetter & lastRow & ")"
+                    ws.Cells(totalRow, c).Font.Bold = True
+                    ws.Cells(totalRow, c).Borders(xlEdgeTop).LineStyle = xlContinuous
+                    ws.Cells(totalRow, c).Borders(xlEdgeBottom).LineStyle = xlDouble
+                Else
+                    ' Case 2: Matched & Unmatched Blocks
+                    matchedEndRow = unmatchedHeaderRow - 6
+                    If matchedEndRow >= 2 Then
+                        ws.Cells(unmatchedHeaderRow - 5, 1).Value = "MATCHED TOTAL"
+                        ws.Cells(unmatchedHeaderRow - 5, 1).Font.Bold = True
+                        ws.Cells(unmatchedHeaderRow - 5, c).Formula = "=SUM(" & colLetter & "2:" & colLetter & matchedEndRow & ")"
+                        ws.Cells(unmatchedHeaderRow - 5, c).Font.Bold = True
+                    End If
+                    
+                    unmatchedStartRow = unmatchedHeaderRow + 1
+                    If lastRow >= unmatchedStartRow Then
+                        totalRow = lastRow + 2
+                        ws.Cells(totalRow, 1).Value = "UNMATCHED TOTAL"
+                        ws.Cells(totalRow, 1).Font.Bold = True
+                        ws.Cells(totalRow, c).Formula = "=SUM(" & colLetter & unmatchedStartRow & ":" & colLetter & lastRow & ")"
+                        ws.Cells(totalRow, c).Font.Bold = True
+                        ws.Cells(totalRow, c).Borders(xlEdgeTop).LineStyle = xlContinuous
+                        ws.Cells(totalRow, c).Borders(xlEdgeBottom).LineStyle = xlDouble
+                    End If
+                End If
+                Exit For
+            End If
+        Next c
+    Next h
+End Sub
+
+' Helper: Convert Column Index Number to Letter (e.g. 24 -> "X")
+Private Function GetColLetter(ByVal colNum As Long) As String
+    Dim v As Long, r As Long
+    GetColLetter = ""
+    Do While colNum > 0
+        v = (colNum - 1) \ 26
+        r = (colNum - 1) Mod 26
+        GetColLetter = Chr(65 + r) & GetColLetter
+        colNum = v
+    Loop
+End Function
+
+' Helper: Update Internal Kora Ledger Recon Status (Single Column Search)
+Private Sub UpdateLedgerStatus(ByRef ledgerWS As Worksheet, ByRef ledgerData As Variant, _
+                               ByVal validRows As Long, ByVal lastCol As Long, _
+                               ByRef matchedArray() As Boolean, ByVal processorKeyword As String, _
+                               ByVal procNameCol As Long)
+
+    Dim statusCol As Long, k As Long, procName As String
+
+    If Trim(CStr(ledgerData(1, lastCol))) = "Recon Status" Then
+        statusCol = lastCol
+    Else
+        statusCol = lastCol + 1
+        ledgerWS.Cells(1, statusCol).Value = "Recon Status"
+        ledgerWS.Cells(1, statusCol).Font.Bold = True
+    End If
+
+    For k = 2 To validRows
+        procName = UCase(Trim(CStr(ledgerData(k, procNameCol))))
+        If InStr(procName, processorKeyword) > 0 Then
+            If matchedArray(k) Then
+                ledgerWS.Cells(k, statusCol).Value = "Matched"
+            ElseIf ledgerWS.Cells(k, statusCol).Value = "" Then
+                ledgerWS.Cells(k, statusCol).Value = "Unmatched"
+            End If
+        End If
+    Next k
+End Sub
+
+' Helper: Update Internal Kora Ledger Recon Status (Multi-Column Concatenated Search)
+Private Sub UpdateLedgerStatusMultiCol(ByRef ledgerWS As Worksheet, ByRef ledgerData As Variant, _
+                                       ByVal validRows As Long, ByVal lastCol As Long, _
+                                       ByRef matchedArray() As Boolean, ByVal keywords As Variant)
+
+    Dim statusCol As Long, k As Long, m As Long, procName As String, kw As String, matchKeyword As Boolean
+
+    If Trim(CStr(ledgerData(1, lastCol))) = "Recon Status" Then
+        statusCol = lastCol
+    Else
+        statusCol = lastCol + 1
+        ledgerWS.Cells(1, statusCol).Value = "Recon Status"
+        ledgerWS.Cells(1, statusCol).Font.Bold = True
+    End If
+
+    For k = 2 To validRows
+        procName = UCase(Trim(CStr(ledgerData(k, 1)))) & " " & UCase(Trim(CStr(ledgerData(k, 2)))) & " " & UCase(Trim(CStr(ledgerData(k, 3))))
+        
+        matchKeyword = False
+        For m = LBound(keywords) To UBound(keywords)
+            kw = UCase(Trim(CStr(keywords(m))))
+            If InStr(procName, kw) > 0 Then
+                matchKeyword = True
+                Exit For
+            End If
+        Next m
+
+        If matchKeyword Then
+            If matchedArray(k) Then
+                ledgerWS.Cells(k, statusCol).Value = "Matched"
+            ElseIf ledgerWS.Cells(k, statusCol).Value = "" Then
+                ledgerWS.Cells(k, statusCol).Value = "Unmatched"
+            End If
+        End If
+    Next k
+End Sub
+
+' Helper: Universal Prefix Stripper for Nsano References
+Private Function StripNsanoPrefix(ByVal rawRef As String) As String
+    Dim ref As String
+    ref = Trim(rawRef)
+    If ref = "" Then StripNsanoPrefix = "": Exit Function
+    
+    Dim uRef As String
+    uRef = UCase(ref)
+    
+    If Left(uRef, 7) = "KORAPAY" Then
+        ref = Mid(ref, 8)
+    ElseIf Left(uRef, 3) = "BNA" Then
+        ref = Mid(ref, 4)
+    ElseIf Left(uRef, 3) = "KPY" Then
+        ref = Mid(ref, 4)
+    End If
+    
+    ref = Trim(ref)
+    Do While Left(ref, 1) = "-" Or Left(ref, 1) = "_" Or Left(ref, 1) = " "
+        ref = Mid(ref, 2)
+        ref = Trim(ref)
+    Loop
+    
+    StripNsanoPrefix = UCase(Trim(ref))
+End Function
+
+' Custom Date Parser (Handles "Thu Aug 06 2026...", ISO, M/D/YY, and Text Dates)
+Private Function SafeDateText(val As Variant) As Date
+    Dim txt As String, datePart As String, parts() As String, dParts() As String
+    Dim mStr As String, dStr As String, yStr As String, mNum As Integer, yNum As Integer
+    Dim p As Long
+
+    On Error Resume Next
+    If IsError(val) Or IsNull(val) Or IsEmpty(val) Then SafeDateText = 0: Exit Function
+    If IsDate(val) Then SafeDateText = Int(CDate(val)): If SafeDateText > 0 Then Exit Function
+    If IsNumeric(val) And Not IsNumeric(CStr(val)) Then SafeDateText = Int(CDbl(val)): Exit Function
+
+    txt = Trim(CStr(val))
+    If txt = "" Then SafeDateText = 0: Exit Function
+
+    ' Extract date portion before 'T' or space
+    If InStr(txt, "T") > 0 And InStr(txt, "-") > 0 Then
+        parts = Split(txt, "T")
+        If IsDate(parts(0)) Then SafeDateText = Int(CDate(parts(0))): If SafeDateText > 0 Then Exit Function
+    End If
+
+    txt = Replace(txt, ",", " ")
+    Do While InStr(txt, "  ") > 0: txt = Replace(txt, "  ", " "): Loop
+    parts = Split(Trim(txt), " ")
+
+    ' Scan parts array for Month Name
+    If UBound(parts) >= 3 Then
+        For p = 0 To UBound(parts) - 2
+            mStr = UCase(Left(parts(p), 3))
+            mNum = MonthNumFromStr(mStr)
+            If mNum > 0 Then
+                dStr = parts(p + 1)
+                yStr = parts(p + 2)
+                If IsNumeric(dStr) And IsNumeric(yStr) Then
+                    yNum = CInt(yStr)
+                    If yNum < 100 Then yNum = 2000 + yNum
+                    SafeDateText = DateSerial(yNum, mNum, CInt(dStr))
+                    If SafeDateText > 0 Then Exit Function
+                End If
+            End If
+        Next p
+    End If
+
+    ' Handles M/D/YY or M/D/YYYY
+    If InStr(txt, "/") > 0 Then
+        dParts = Split(txt, "/")
+        If UBound(dParts) >= 2 Then
+            mNum = CInt(dParts(0)): dStr = dParts(1): yStr = dParts(2)
+            yNum = CInt(yStr)
+            If yNum < 100 Then yNum = 2000 + yNum
+            If mNum >= 1 And mNum <= 12 And IsNumeric(dStr) Then
+                SafeDateText = DateSerial(yNum, mNum, CInt(dStr))
+                Exit Function
+            End If
+        End If
+    End If
+
+    ' Handles YYYY-MM-DD
+    If InStr(txt, "-") > 0 Then
+        dParts = Split(txt, "-")
+        If UBound(dParts) >= 2 Then
+            yNum = CInt(dParts(0))
+            mNum = CInt(dParts(1))
+            dStr = dParts(2)
+            If mNum >= 1 And mNum <= 12 And IsNumeric(dStr) Then
+                SafeDateText = DateSerial(yNum, mNum, CInt(dStr))
+                Exit Function
+            End If
+        End If
+    End If
+
+    SafeDateText = 0
+    On Error GoTo 0
+End Function
+
+' Helper: Convert Month Name String to Month Number
+Private Function MonthNumFromStr(ByVal mStr As String) As Integer
+    Select Case UCase(mStr)
+        Case "JAN": MonthNumFromStr = 1
+        Case "FEB": MonthNumFromStr = 2
+        Case "MAR": MonthNumFromStr = 3
+        Case "APR": MonthNumFromStr = 4
+        Case "MAY": MonthNumFromStr = 5
+        Case "JUN": MonthNumFromStr = 6
+        Case "JUL": MonthNumFromStr = 7
+        Case "AUG": MonthNumFromStr = 8
+        Case "SEP": MonthNumFromStr = 9
+        Case "OCT": MonthNumFromStr = 10
+        Case "NOV": MonthNumFromStr = 11
+        Case "DEC": MonthNumFromStr = 12
+        Case Else: MonthNumFromStr = 0
+    End Select
+End Function
+
